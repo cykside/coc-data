@@ -1,30 +1,25 @@
-name: Auto Update CoC Data
+name: Sync Upstream & Test
 
 on:
-  workflow_dispatch:
-    inputs:
-      update_name:
-        description: "Nama update game yang mau dimasukkan"
-        required: true
-        default: "Town Hall 19 (November 2026)"
   schedule:
-    - cron: "0 2 * * 1" # Setiap Senin 02:00 UTC (09:00 WIB)
+    - cron: "0 2 * * *" # Setiap hari 02:00 UTC (09:00 WIB)
+  workflow_dispatch: # Bisa dijalankan manual dari tab Actions
 
 permissions:
   contents: write
-  pull-requests: write
   issues: write
-  id-token: write
 
 env:
   UPSTREAM_REPO: https://github.com/chiefpansancolt/clash-of-clans-data.git
   BRANCH: main
-  UPDATE_NAME: ${{ inputs.update_name || 'Update terbaru Clash of Clans (cek patch notes resmi)' }}
+  # Penanda bahwa data TH19 sudah masuk di upstream (regex, tidak peka huruf besar/kecil).
+  # Spiky Tower = pertahanan baru TH19. Ubah kalau nama di data berbeda.
+  MARKER_REGEX: "spiky ?tower"
+  ISSUE_TITLE: "Upstream sudah memuat data TH19"
 
 jobs:
-  update:
+  sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
@@ -37,59 +32,72 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      # 1) Sinkron dengan repo asli (kalau pembuatnya sudah update, kita ikut)
-      - name: Sinkron dengan upstream
+      - name: Ambil perubahan dari upstream
+        id: fetch
         run: |
           git remote add upstream "$UPSTREAM_REPO"
           git fetch upstream "$BRANCH"
           BEHIND=$(git rev-list --count HEAD..upstream/$BRANCH)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
           echo "Fork tertinggal $BEHIND commit dari upstream"
-          if [ "$BEHIND" != "0" ]; then
-            git merge upstream/$BRANCH --no-edit
-            git push origin $BRANCH
+
+      - name: Cek apakah upstream sudah memuat data TH19
+        id: marker
+        run: |
+          if git grep -qiE "$MARKER_REGEX" upstream/$BRANCH -- data src; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Penanda TH19 ditemukan di upstream"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "Penanda TH19 belum ada di upstream"
           fi
 
-      - uses: pnpm/action-setup@v4
+      - name: Buat issue pemberitahuan (sekali saja)
+        if: steps.marker.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh issue list --state all --search "\"$ISSUE_TITLE\" in:title" --json number --jq 'length')
+          if [ "$EXISTING" = "0" ]; then
+            gh issue create \
+              --title "$ISSUE_TITLE" \
+              --body "Repo asli (chiefpansancolt/clash-of-clans-data) sekarang memuat data TH19 (penanda: \`$MARKER_REGEX\`). Workflow ini akan menggabungkannya ke fork jika tes dan build lolos. Cek hasil run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          else
+            echo "Issue pemberitahuan sudah pernah dibuat, dilewati"
+          fi
+
+      - name: Merge upstream
+        if: steps.fetch.outputs.behind != '0'
+        run: git merge upstream/$BRANCH --no-edit
+
+      - name: Setup pnpm
+        if: steps.fetch.outputs.behind != '0'
+        uses: pnpm/action-setup@v4
         with:
           version: 10
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        if: steps.fetch.outputs.behind != '0'
+        uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: pnpm
 
       - name: Install dependencies
+        if: steps.fetch.outputs.behind != '0'
         run: pnpm install --frozen-lockfile
 
-      # 2) Claude membaca struktur repo, mengambil data dari Wiki, mengedit data, tes, dan buka PR
-      - name: Update data dengan Claude Code
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          claude_args: |
-            --max-turns 60
-            --max-budget-usd 5
-            --allowedTools "Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Bash(git:*),Bash(gh:*),Bash(pnpm:*),Bash(ls:*),Bash(cat:*)"
-          prompt: |
-            Kamu memperbarui repo data Clash of Clans ini (paket npm TypeScript dengan data JSON).
+      - name: Test
+        if: steps.fetch.outputs.behind != '0'
+        run: pnpm test
 
-            TARGET UPDATE: ${{ env.UPDATE_NAME }}
+      - name: Build
+        if: steps.fetch.outputs.behind != '0'
+        run: pnpm build
 
-            LANGKAH:
-            1. Cek apakah sudah ada PR terbuka dari branch berawalan "auto/coc-update". Kalau ada, berhenti dan jelaskan singkat.
-            2. Baca .github/CONTRIBUTING.md, README.md, folder scripts, dan folder data/src/tests untuk memahami format data dan aturan penulisan.
-            3. Cek apakah data untuk target update ini SUDAH ada di repo. Kalau sudah lengkap, berhenti dan jelaskan singkat.
-            4. Kumpulkan data resmi dari Clash of Clans Wiki (https://clashofclans.fandom.com/wiki/) dan patch notes resmi Supercell: bangunan/pertahanan baru, level baru (hero, pasukan, mantra, bangunan, tembok, jebakan), squad, dan perubahan lain yang relevan dengan skema data repo.
-            5. Buat branch baru bernama auto/coc-update-YYYY-MM-DD, lalu edit file di folder data (dan types/src bila skema perlu diperluas) dengan mengikuti pola entri yang sudah ada persis.
-            6. Jalankan `pnpm test`, `pnpm lint` (jika ada), dan `pnpm build`. Perbaiki sampai lolos.
-            7. Commit, push branch, lalu buka Pull Request ke branch main dengan `gh pr create`.
-
-            ATURAN PENTING:
-            - JANGAN mengarang angka. Kalau suatu nilai (biaya, waktu, HP, damage) belum ada di Wiki atau sumber resmi, JANGAN diisi dan jangan ditebak. Catat sebagai TODO di deskripsi PR.
-            - Jangan memodifikasi file di .github/workflows.
-            - Jangan menghapus data yang sudah ada kecuali sumber resmi menyatakan nilainya berubah.
-            - Deskripsi PR harus berisi: apa yang ditambahkan, URL sumber untuk tiap bagian, dan daftar TODO yang belum bisa diisi.
+      - name: Push hasil sinkronisasi
+        if: steps.fetch.outputs.behind != '0'
+        run: git push origin $BRANCH
 
       - name: Buat issue jika gagal
         if: failure()
@@ -97,6 +105,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh issue create \
-            --title "Auto update data gagal ($(date +%F))" \
-            --body "Cek log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            --title "Sinkronisasi upstream gagal ($(date +%F))" \
+            --body "Merge, test, atau build gagal. Cek log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             
